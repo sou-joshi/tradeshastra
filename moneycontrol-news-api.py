@@ -24,9 +24,9 @@ METADATA_FILE = "metadata/news_ids.txt"
 MONEYCONTROL_NEWS_URLS = [
     "https://www.moneycontrol.com/news/business/markets/",
     "https://www.moneycontrol.com/news/business/",
-    #"https://www.moneycontrol.com/news/business/stocks/",
-    #"https://www.moneycontrol.com/news/business/economy/",
-    #"https://www.moneycontrol.com/news/business/ipo/",
+    "https://www.moneycontrol.com/news/business/stocks/",
+    "https://www.moneycontrol.com/news/business/economy/",
+    "https://www.moneycontrol.com/news/business/ipo/",
 ]
 
 # Setup Logger
@@ -151,7 +151,7 @@ def fetch_news_articles():
         list: List of news articles with metadata and full content
     """
     news_data = []
-    max_articles = 50  # Stop after collecting 50 articles
+    max_articles = 60
 
     for category_url in MONEYCONTROL_NEWS_URLS:
         try:
@@ -167,13 +167,13 @@ def fetch_news_articles():
 
             for article in articles:
                 if len(news_data) >= max_articles:
-                    return news_data  # Stop once 50 articles are collected
+                    return news_data
 
                 title_element = article.find("h2")
                 link_element = article.find("a")
 
                 if not title_element or not link_element:
-                    continue  # Skip if title or link is missing
+                    continue
 
                 title = title_element.text.strip()
                 link = link_element["href"]
@@ -206,7 +206,8 @@ def fetch_news_articles():
 
 def save_to_s3(data):
     """
-    Saves deduplicated news articles to S3 in Parquet format.
+    Saves deduplicated news articles to S3 in partitioned Parquet format.
+    Partitions by `year/month/day` for better organization.
     """
     if not data:
         log_to_cloudwatch("INFO", "No new data to save.")
@@ -220,14 +221,19 @@ def save_to_s3(data):
         return
 
     df = pd.DataFrame(new_data)
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
-    s3_key = f"{NEWS_FOLDER}moneycontrol_news_{timestamp}.parquet"
+    timestamp = datetime.utcnow()
+    year, month, day = timestamp.strftime("%Y"), timestamp.strftime("%m"), timestamp.strftime("%d")
 
+    # Define S3 key with partitioning
+    s3_key = f"{NEWS_FOLDER}year={year}/month={month}/day={day}/moneycontrol_news_{timestamp.strftime('%Y-%m-%d_%H-%M-%S')}.parquet"
+
+    # Save as Parquet
     df.to_parquet("/tmp/news.parquet", index=False)
     s3_client.upload_file("/tmp/news.parquet", S3_BUCKET_NAME, s3_key)
 
     update_metadata_file([news["news_id"] for news in new_data])
-    log_to_cloudwatch("INFO", f"Saved {len(new_data)} new articles to S3.")
+    log_to_cloudwatch("INFO", f"Saved {len(new_data)} new articles to S3 at {s3_key}.")
+    
 
 def lambda_handler(event, context):
     """
@@ -235,6 +241,7 @@ def lambda_handler(event, context):
     """
     log_to_cloudwatch("INFO", "Starting Moneycontrol News Scraper...")
     news_data = fetch_news_articles()
+    print(news_data)
     save_to_s3(news_data)
     log_to_cloudwatch("INFO", "Pipeline execution completed.")
 
