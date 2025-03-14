@@ -1,113 +1,128 @@
-import os
 import sys
-import boto3
 import json
-import requests
-import logging
-import nltk
-import yfinance as yf
-from bs4 import BeautifulSoup
-from transformers import pipeline
+import boto3
+import time
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf, col
-from pyspark.sql.types import StringType, DoubleType
+from pyspark.sql.types import StringType
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+from urllib.request import urlopen
+from urllib.error import URLError, HTTPError
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Initialize Spark and Glue Context
+spark = SparkSession.builder.appName("MoneyControlNewsProcessing").getOrCreate()
+glueContext = GlueContext(spark)
+sc = spark.sparkContext
+job = Job(glueContext)
 
-# Initialize Spark Session
-spark = SparkSession.builder.appName("NewsSentimentAnalysis").getOrCreate()
+# Read arguments
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+job.init(args['JOB_NAME'], args)
 
-# AWS S3 Configuration
-INPUT_S3_PATH = "s3://tradeshastra-raw/moneycontrol-news/"
-OUTPUT_S3_PATH = "s3://tradeshastra-conformed/moneycontrol-news/"
-
-# Initialize Transformers Pipelines
-ner_pipeline = pipeline("ner", model="dbmdz/bert-large-cased-finetuned-conll03-english")
-sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-
-# Download Required NLTK Resources
-nltk.download("vader_lexicon")
-
-# Load Data from S3
-df = spark.read.parquet(INPUT_S3_PATH)
-
+# Function to fetch and clean article content
 def fetch_article_content(url):
-    """Fetches the full article content from a URL if the original content is missing."""
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, "html.parser")
-            paragraphs = soup.find_all("p")
-            article_text = " ".join([p.get_text() for p in paragraphs if p.get_text()])
-            
-            return article_text if article_text else "Content not available"
+        response = urlopen(url)
+        html_content = response.read().decode("utf-8")
+
+        # Create boto3 client inside UDF to avoid PicklingError
+        bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+        # Prompt ensuring only the article content is returned
+        prompt = (
+            "Extract and return only the main article content from the following HTML. "
+            "Ensure no additional information, summaries, or formatting details are returned. "
+            "Strictly return only the clean article text:\n\n"
+            f"{html_content}"
+        )
+
+        model_request = {
+            "prompt": prompt,
+            "max_tokens": 2048,
+            "temperature": 0.3
+        }
+
+        response = bedrock_runtime.invoke_model(
+            modelId="us.meta.llama3-3-70b-instruct-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(model_request)
+        )
+
+        # Parse response
+        result = json.loads(response["body"].read().decode("utf-8"))
+        content = result.get("content", "").strip()
+
+        return content if content else None
+
+    except (URLError, HTTPError) as e:
+        print(f"Error fetching URL {url}: {e}")
+        return None
+    except Exception as e:
+        print(f"Error processing {url}: {e}")
+        return None
+
+# Function to extract company tickers using NER
+def extract_tickers(content):
+    try:
+        if not content:
+            return None
+
+        # Create boto3 client inside UDF to avoid PicklingError
+        bedrock_runtime = boto3.client("bedrock-runtime", region_name="us-east-1")
+
+        # Prompt ensuring only the company names are returned
+        prompt = (
+            "Identify and return only the company names mentioned in this article, separated by commas. "
+            "Do not return any extra text, explanations, or formatting details. "
+            "Only return a comma-separated list of company names:\n\n"
+            f"{content}"
+        )
+
+        model_request = {
+            "prompt": prompt,
+            "max_tokens": 512,
+            "temperature": 0.2
+        }
+
+        response = bedrock_runtime.invoke_model(
+            modelId="us.meta.llama3-3-70b-instruct-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps(model_request)
+        )
+
+        # Parse response
+        result = json.loads(response["body"].read().decode("utf-8"))
+        tickers = result.get("content", "").strip()
+
+        # Ensure no extra text, only company names
+        if tickers:
+            return tickers.replace("\n", "").replace(" ", "").strip(",")
         else:
-            logging.warning(f"Failed to fetch content from {url} - HTTP {response.status_code}")
-            return "Content not available"
-    except requests.RequestException as e:
-        logging.error(f"Request failed for {url} - {str(e)}")
-        return "Content not available"
+            return None
 
-def extract_tickers(text):
-    """Extracts stock tickers using BERT Named Entity Recognition (NER)."""
-    if not text or text == "Content not available":
-        return ""
-    
-    entities = ner_pipeline(text)
-    tickers = set()
+    except Exception as e:
+        print(f"Error extracting tickers: {e}")
+        return None
 
-    for entity in entities:
-        if entity["entity"].startswith("B-ORG"):
-            symbol = entity["word"].upper()
-            try:
-                stock = yf.Ticker(symbol)
-                if stock.info.get("regularMarketPrice") is not None:
-                    tickers.add(symbol)
-            except Exception as e:
-                logging.debug(f"Failed to validate ticker {symbol}: {str(e)}")
-
-    return ", ".join(tickers)
-
-def analyze_sentiment(text):
-    """Analyzes sentiment of the text using BERT Sentiment Analysis Model."""
-    if not text or text == "Content not available":
-        return {"score": 0, "sentiment": "Neutral"}
-    
-    result = sentiment_pipeline(text[:512])[0]  # Limit text length for BERT
-    sentiment_label = result["label"]
-    sentiment_score = result["score"]
-
-    sentiment = "Positive" if sentiment_label == "POSITIVE" else "Negative" if sentiment_label == "NEGATIVE" else "Neutral"
-
-    return {"score": sentiment_score, "sentiment": sentiment}
-
-def assign_sentiment_per_ticker(text):
-    """Assigns sentiment scores to extracted tickers."""
-    tickers = extract_tickers(text)
-    sentiment = analyze_sentiment(text)
-
-    ticker_sentiments = [{"ticker": ticker, "score": sentiment["score"], "sentiment": sentiment["sentiment"]} for ticker in tickers.split(", ")]
-    
-    return json.dumps(ticker_sentiments)
-
-# Define UDFs for Spark Processing
-fetch_content_udf = udf(fetch_article_content, StringType())
+# Register UDFs for Spark (using `@udf` instead of passing client)
+fetch_article_content_udf = udf(fetch_article_content, StringType())
 extract_tickers_udf = udf(extract_tickers, StringType())
-analyze_sentiment_udf = udf(lambda text: analyze_sentiment(text)["score"], DoubleType())
-classify_sentiment_udf = udf(lambda text: analyze_sentiment(text)["sentiment"], StringType())
-ticker_sentiment_udf = udf(assign_sentiment_per_ticker, StringType())
 
-# Apply Transformations
-df = df.withColumn("content", fetch_content_udf(col("link"))) \
-       .withColumn("tickers", extract_tickers_udf(col("content"))) \
-       .withColumn("overall_sentiment_score", analyze_sentiment_udf(col("content"))) \
-       .withColumn("overall_sentiment", classify_sentiment_udf(col("content"))) \
-       .withColumn("ticker_sentiments", ticker_sentiment_udf(col("content")))
+# Read input Parquet file from S3
+input_s3_path = "s3://tradeshastra-raw/moneycontrol-news/"
+df = glueContext.read.format("parquet").load(input_s3_path)
 
-# Write Data to S3 in Parquet Format
-df.write.mode("overwrite").parquet(OUTPUT_S3_PATH)
+# Apply transformations
+df = df.withColumn("content", fetch_article_content_udf(col("link")))
+df = df.withColumn("ticker", extract_tickers_udf(col("content")))
 
-logging.info(f"Sentiment analysis job completed successfully. Data stored at {OUTPUT_S3_PATH}")
+# Write output to a new S3 bucket
+output_s3_path = "s3://tradeshastra-raw/moneycontrol-news-final/"
+df.write.mode("overwrite").parquet(output_s3_path)
+
+# Commit the job
+job.commit()
