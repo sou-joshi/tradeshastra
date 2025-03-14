@@ -1,99 +1,113 @@
 import os
 import sys
 import boto3
+import json
+import requests
+import logging
 import nltk
 import yfinance as yf
+from bs4 import BeautifulSoup
 from transformers import pipeline
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import udf, col
-from pyspark.sql.types import StringType, ArrayType, DoubleType, StructType, StructField
+from pyspark.sql.types import StringType, DoubleType
 
-# Download NLTK resources
-nltk.download("vader_lexicon")
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Create Spark Session
+# Initialize Spark Session
 spark = SparkSession.builder.appName("NewsSentimentAnalysis").getOrCreate()
 
-# S3 Paths
+# AWS S3 Configuration
 INPUT_S3_PATH = "s3://tradeshastra-raw/moneycontrol-news/"
 OUTPUT_S3_PATH = "s3://tradeshastra-conformed/moneycontrol-news/"
+
+# Initialize Transformers Pipelines
+ner_pipeline = pipeline("ner", model="dbmdz/bert-large-cased-finetuned-conll03-english")
+sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+
+# Download Required NLTK Resources
+nltk.download("vader_lexicon")
 
 # Load Data from S3
 df = spark.read.parquet(INPUT_S3_PATH)
 
-# Load Pre-trained BERT Models from Hugging Face
-ner_pipeline = pipeline("ner", model="dbmdz/bert-large-cased-finetuned-conll03-english")
-sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+def fetch_article_content(url):
+    """Fetches the full article content from a URL if the original content is missing."""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            paragraphs = soup.find_all("p")
+            article_text = " ".join([p.get_text() for p in paragraphs if p.get_text()])
+            
+            return article_text if article_text else "Content not available"
+        else:
+            logging.warning(f"Failed to fetch content from {url} - HTTP {response.status_code}")
+            return "Content not available"
+    except requests.RequestException as e:
+        logging.error(f"Request failed for {url} - {str(e)}")
+        return "Content not available"
 
-# Function to Extract Stock Tickers using BERT NER
 def extract_tickers(text):
-    if not text or text == "Full content not available":
-        return []
+    """Extracts stock tickers using BERT Named Entity Recognition (NER)."""
+    if not text or text == "Content not available":
+        return ""
     
     entities = ner_pipeline(text)
     tickers = set()
 
     for entity in entities:
-        if entity["entity"].startswith("B-ORG"):  # BERT detects organizations well
+        if entity["entity"].startswith("B-ORG"):
             symbol = entity["word"].upper()
             try:
                 stock = yf.Ticker(symbol)
-                if stock.info.get("regularMarketPrice") is not None:  # Validate real ticker
+                if stock.info.get("regularMarketPrice") is not None:
                     tickers.add(symbol)
-            except:
-                continue
+            except Exception as e:
+                logging.debug(f"Failed to validate ticker {symbol}: {str(e)}")
 
-    return list(tickers)
+    return ", ".join(tickers)
 
-# Function to Assign Sentiment Score using BERT
 def analyze_sentiment(text):
-    if not text or text == "Full content not available":
+    """Analyzes sentiment of the text using BERT Sentiment Analysis Model."""
+    if not text or text == "Content not available":
         return {"score": 0, "sentiment": "Neutral"}
-
-    result = sentiment_pipeline(text[:512])[0]  # BERT has a token limit, so truncate if needed
+    
+    result = sentiment_pipeline(text[:512])[0]  # Limit text length for BERT
     sentiment_label = result["label"]
     sentiment_score = result["score"]
 
-    if sentiment_label == "POSITIVE":
-        sentiment = "Positive"
-    elif sentiment_label == "NEGATIVE":
-        sentiment = "Negative"
-    else:
-        sentiment = "Neutral"
+    sentiment = "Positive" if sentiment_label == "POSITIVE" else "Negative" if sentiment_label == "NEGATIVE" else "Neutral"
 
     return {"score": sentiment_score, "sentiment": sentiment}
 
-# Function to Assign Sentiment Per Ticker
 def assign_sentiment_per_ticker(text):
+    """Assigns sentiment scores to extracted tickers."""
     tickers = extract_tickers(text)
     sentiment = analyze_sentiment(text)
+
+    ticker_sentiments = [{"ticker": ticker, "score": sentiment["score"], "sentiment": sentiment["sentiment"]} for ticker in tickers.split(", ")]
     
-    ticker_sentiments = [{"ticker": ticker, "score": sentiment["score"], "sentiment": sentiment["sentiment"]} for ticker in tickers]
-    
-    return ticker_sentiments
+    return json.dumps(ticker_sentiments)
 
 # Define UDFs for Spark Processing
-extract_tickers_udf = udf(extract_tickers, ArrayType(StringType()))
+fetch_content_udf = udf(fetch_article_content, StringType())
+extract_tickers_udf = udf(extract_tickers, StringType())
 analyze_sentiment_udf = udf(lambda text: analyze_sentiment(text)["score"], DoubleType())
 classify_sentiment_udf = udf(lambda text: analyze_sentiment(text)["sentiment"], StringType())
-
-# Define StructType for Ticker Sentiments
-ticker_sentiment_schema = ArrayType(
-    StructType([
-        StructField("ticker", StringType(), True),
-        StructField("score", DoubleType(), True),
-        StructField("sentiment", StringType(), True)
-    ])
-)
-ticker_sentiment_udf = udf(assign_sentiment_per_ticker, ticker_sentiment_schema)
+ticker_sentiment_udf = udf(assign_sentiment_per_ticker, StringType())
 
 # Apply Transformations
-df = df.withColumn("tickers", extract_tickers_udf(col("content"))) \
+df = df.withColumn("content", fetch_content_udf(col("link"))) \
+       .withColumn("tickers", extract_tickers_udf(col("content"))) \
        .withColumn("overall_sentiment_score", analyze_sentiment_udf(col("content"))) \
        .withColumn("overall_sentiment", classify_sentiment_udf(col("content"))) \
        .withColumn("ticker_sentiments", ticker_sentiment_udf(col("content")))
 
-# Save Processed Data to S3 in Parquet Format
+# Write Data to S3 in Parquet Format
 df.write.mode("overwrite").parquet(OUTPUT_S3_PATH)
 
-print("Glue Job Completed Successfully.")
+logging.info(f"Sentiment analysis job completed successfully. Data stored at {OUTPUT_S3_PATH}")
