@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datetime import datetime
 import xml.etree.ElementTree as ET
+import re
 
 # AWS Config
 AWS_REGION = "us-east-1"
@@ -150,14 +151,19 @@ def save_to_dynamodb(item):
     except Exception as e:
         logger.error(f"Failed to insert into DynamoDB: {e}")
 
+
 def detect_related_companies(title, description):
     content = (title + " " + (description or "")).lower()
     symbols, matched = set(), set()
+
     for keyword, symbol in STOCK_KEYWORDS.items():
-        if keyword in content:
+        pattern = r'\b' + re.escape(keyword.lower()) + r'\b'
+        if re.search(pattern, content):
             symbols.add(symbol)
             matched.add(keyword)
+    
     return list(symbols), list(matched)
+
 
 def parse_rss_feed(url):
     new_articles = []
