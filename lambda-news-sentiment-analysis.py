@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 HF_TOKEN = os.environ.get("HF_API_TOKEN", "your_token_here_if_testing_locally")
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
-CONFIDENCE_THRESHOLD = 0.7  # Minimum confidence score to accept a prediction
+CONFIDENCE_THRESHOLD = 0.7
 
 MODELS = {
     "finbert-tone": "yiyanghkust/finbert-tone",
