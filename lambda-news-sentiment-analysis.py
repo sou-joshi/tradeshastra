@@ -4,6 +4,83 @@ from bs4 import BeautifulSoup
 import os
 from datetime import datetime
 import logging
+import boto3
+from collections import Counter
+
+DYNAMODB_TABLE_NAME = os.environ.get("DYNAMODB_TABLE_NAME", "SentimentNewsAnalysis")
+dynamodb = boto3.resource("dynamodb")
+
+from decimal import Decimal
+
+from decimal import Decimal
+
+def convert_floats_to_decimal(obj):
+    """Recursively convert float to Decimal for DynamoDB compatibility."""
+    if isinstance(obj, list):
+        return [convert_floats_to_decimal(i) for i in obj]
+    elif isinstance(obj, dict):
+        return {k: convert_floats_to_decimal(v) for k, v in obj.items()}
+    elif isinstance(obj, float):
+        return Decimal(str(obj))
+    else:
+        return obj
+
+def upload_to_dynamodb(
+    url,
+    company,
+    timestamp,
+    final_sentiment,
+    text_snippet,
+    model_results
+):
+    try:
+        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+
+        item = {
+            "url": url,
+            "timestamp": timestamp,
+            "company": company,
+            "final_label": final_sentiment["final_label"],
+            "final_score": final_sentiment["final_score"],
+            "final_confidence": final_sentiment["final_confidence"],
+            "text_snippet": text_snippet,
+            "model_results": model_results
+        }
+
+        item = convert_floats_to_decimal(item)
+        table.put_item(Item=item)
+        logger.info("Uploaded sentiment data to DynamoDB")
+
+    except Exception as e:
+        logger.error(f"Failed to upload to DynamoDB: {e}")
+
+
+
+def determine_final_label(results):
+    label_scores = {}
+    all_labels = []
+
+    for model_result in results.values():
+        if model_result["status"] == "success":
+            label = model_result["label"]
+            score = model_result["score"]
+            all_labels.append(label)
+            label_scores.setdefault(label, []).append(score)
+
+    if not all_labels:
+        return {"final_label": "unknown", "final_score": 0.0, "final_confidence": "low confidence"}
+
+    # Majority vote
+    label_counter = Counter(all_labels)
+    most_common_label, _ = label_counter.most_common(1)[0]
+    avg_score = sum(label_scores[most_common_label]) / len(label_scores[most_common_label])
+    confidence = interpret_confidence(avg_score)
+
+    return {
+        "final_label": most_common_label,
+        "final_score": round(avg_score, 4),
+        "final_confidence": confidence
+    }
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -12,7 +89,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 HF_TOKEN = os.environ.get("HF_API_TOKEN", "your_token_here_if_testing_locally")
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
-CONFIDENCE_THRESHOLD = 0.7
+CONFIDENCE_THRESHOLD = 0.7  # Minimum confidence score to accept a prediction
 
 MODELS = {
     "finbert-tone": "yiyanghkust/finbert-tone",
@@ -48,7 +125,7 @@ LABEL_MAPPING = {
 
 def standardize_label(model_name, original_label):
     """Convert model-specific labels to standard labels"""
-    model_key = MODEL_ALIAS.get(model_name, model_name)  # Normalize to short key
+    model_key = MODEL_ALIAS.get(model_name, model_name)
 
     normalized_label = original_label.upper() if model_key == "twitter-roberta" else original_label.lower()
     mapped = LABEL_MAPPING.get(model_key, {}).get(normalized_label)
@@ -75,7 +152,7 @@ def fetch_article_text(url):
         res = requests.get(url, headers=headers, timeout=10)
         res.raise_for_status()
 
-        soup = BeautifulSoup(res.text, "lxml")
+        soup = BeautifulSoup(res.text, "html.parser")
         selectors = [
             "div.article_content", "div.content_wrapper",
             "div.article-body", "article", "div.story-content"
@@ -99,7 +176,7 @@ def analyze_sentiment(text, model_name):
         response = requests.post(
             endpoint,
             headers=HEADERS,
-            json={"inputs": text[:512]},  # Truncate to avoid token limits
+            json={"inputs": text[:512]},
             timeout=15
         )
         response.raise_for_status()
@@ -181,13 +258,17 @@ def lambda_handler(event, context):
             results[name] = analyze_sentiment(analysis_text, model)
             logger.info(f"Result for {name}: {json.dumps(results[name], indent=2)}")
 
+        # Determine final sentiment
+        final_sentiment = determine_final_label(results)
+
         response_data = {
             "url": url,
             "company": company,
             "timestamp": datetime.utcnow().isoformat(),
             "text_length": len(article_text),
-            "analysis": results,
             "text_snippet": article_text[:200] + "..." if len(article_text) > 200 else article_text,
+            "analysis": results,
+            "final_sentiment": final_sentiment,
             "confidence_interpretation": {
                 "very high confidence": ">90% certainty",
                 "high confidence": "70-90% certainty",
@@ -196,9 +277,17 @@ def lambda_handler(event, context):
             }
         }
 
-        logger.info("==== FINAL CLEAN OUTPUT ====")
-        logger.info(json.dumps(response_data, indent=2))
-        print(json.dumps(response_data, indent=2))
+        # Upload to DynamoDB
+        upload_to_dynamodb(
+        url=url,
+        company=company,
+        timestamp=response_data["timestamp"],
+        final_sentiment=final_sentiment,
+        text_snippet=response_data["text_snippet"],
+        model_results=results
+        )
+
+
 
         return {
             "statusCode": 200,
